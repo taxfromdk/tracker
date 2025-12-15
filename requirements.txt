@@ -1,3 +1,5 @@
 opencv-python
 numpy
 pygame
+PyOpenGL
+PyOpenGL-accelerate

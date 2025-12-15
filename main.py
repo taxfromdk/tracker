@@ -4,6 +4,9 @@ import numpy as np
 import sys
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from OpenGL.GL import *
+from OpenGL.GL.shaders import compileProgram, compileShader
+import OpenGL.GL as gl
 
 class Tracker:
     def __init__(self, x, y, frame, patch_size=32, search_size=100, auto_created=False):
@@ -67,7 +70,7 @@ class Tracker:
                 else:
                     self.alive = False
     
-    def draw(self, screen, font):
+    def draw_opengl(self):
         with self.lock:
             if not self.alive:
                 return
@@ -76,40 +79,42 @@ class Tracker:
             correlation_score = self.correlation_score
             frames_lived = self.frames_lived
         
-        # Draw blue rectangle for search area
-        search_rect = pygame.Rect(
-            current_pos[0] - self.search_size,
-            current_pos[1] - self.search_size,
-            2 * self.search_size + 1,
-            2 * self.search_size + 1
-        )
-        # Clip to screen bounds
-        search_rect.clamp_ip(pygame.Rect(0, 0, screen.get_width(), screen.get_height() - 50))
-        pygame.draw.rect(screen, (0, 100, 255), search_rect, 1)
+        # Draw using OpenGL immediate mode (can be optimized with VBOs later)
+        glDisable(GL_TEXTURE_2D)
         
-        # Draw rectangle at current position (green for manual, cyan for auto)
-        patch_rect = pygame.Rect(
-            current_pos[0] - self.patch_size,
-            current_pos[1] - self.patch_size,
-            2 * self.patch_size + 1,
-            2 * self.patch_size + 1
-        )
-        color = (0, 255, 255) if self.auto_created else (0, 255, 0)
-        pygame.draw.rect(screen, color, patch_rect, 2)
+        # Draw search area rectangle (blue)
+        glColor3f(0.0, 0.4, 1.0)
+        glLineWidth(1)
+        glBegin(GL_LINE_LOOP)
+        glVertex2f(current_pos[0] - self.search_size, current_pos[1] - self.search_size)
+        glVertex2f(current_pos[0] + self.search_size, current_pos[1] - self.search_size)
+        glVertex2f(current_pos[0] + self.search_size, current_pos[1] + self.search_size)
+        glVertex2f(current_pos[0] - self.search_size, current_pos[1] + self.search_size)
+        glEnd()
         
-        # Draw red dot at current position
-        pygame.draw.circle(screen, (255, 0, 0), current_pos, 5, 2)
+        # Draw patch rectangle (green for manual, cyan for auto)
+        if self.auto_created:
+            glColor3f(0.0, 1.0, 1.0)  # Cyan
+        else:
+            glColor3f(0.0, 1.0, 0.0)  # Green
         
-        # Display correlation score
-        corr_text = font.render(f"{correlation_score:.3f}", True, (255, 255, 0))
-        text_x = min(current_pos[0] + 10, screen.get_width() - 50)
-        text_y = max(0, current_pos[1] - 10)
-        screen.blit(corr_text, (text_x, text_y))
+        glLineWidth(2)
+        glBegin(GL_LINE_LOOP)
+        glVertex2f(current_pos[0] - self.patch_size, current_pos[1] - self.patch_size)
+        glVertex2f(current_pos[0] + self.patch_size, current_pos[1] - self.patch_size)
+        glVertex2f(current_pos[0] + self.patch_size, current_pos[1] + self.patch_size)
+        glVertex2f(current_pos[0] - self.patch_size, current_pos[1] + self.patch_size)
+        glEnd()
         
-        # Display frames lived below correlation score
-        frames_text = font.render(f"{frames_lived}", True, (255, 255, 255))
-        frames_y = min(current_pos[1] + 10, screen.get_height() - 50)
-        screen.blit(frames_text, (text_x, frames_y))
+        # Draw red dot
+        glColor3f(1.0, 0.0, 0.0)
+        glPointSize(5)
+        glBegin(GL_POINTS)
+        glVertex2f(current_pos[0], current_pos[1])
+        glEnd()
+        
+        # Note: Text rendering in OpenGL requires more setup
+        # For now, we'll handle text separately or use bitmap fonts
 
 pygame.init()
 
@@ -124,9 +129,47 @@ if not ret:
     sys.exit()
 
 height, width, _ = frame.shape
-screen = pygame.display.set_mode((width, height + 50))
+screen = pygame.display.set_mode((width, height + 50), pygame.OPENGL | pygame.DOUBLEBUF)
 pygame.display.set_caption("Video Player")
 clock = pygame.time.Clock()
+
+# OpenGL setup
+glViewport(0, 0, width, height + 50)
+glMatrixMode(GL_PROJECTION)
+glLoadIdentity()
+glOrtho(0, width, height + 50, 0, -1, 1)
+glMatrixMode(GL_MODELVIEW)
+glLoadIdentity()
+
+# Enable blending for overlay elements
+glEnable(GL_BLEND)
+glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+# Create texture for video frame
+video_texture = glGenTextures(1)
+glBindTexture(GL_TEXTURE_2D, video_texture)
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+# Create 4096x4096 render target
+render_texture_size = 4096
+render_texture = glGenTextures(1)
+glBindTexture(GL_TEXTURE_2D, render_texture)
+glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, render_texture_size, render_texture_size, 0, GL_RGB, GL_UNSIGNED_BYTE, None)
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+
+# Create framebuffer for render texture
+framebuffer = glGenFramebuffers(1)
+glBindFramebuffer(GL_FRAMEBUFFER, framebuffer)
+glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, render_texture, 0)
+
+# Check framebuffer completeness
+if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+    print("Framebuffer not complete!")
+
+# Return to default framebuffer
+glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
 playing = True
 dragging = False
@@ -134,6 +177,8 @@ speed_multiplier = 1.0
 user_trackers = []
 auto_trackers = []
 executor = ThreadPoolExecutor(max_workers=8)
+show_render_texture = False
+start_time = pygame.time.get_ticks()
 
 def draw_slider(screen, current_frame, total_frames, width):
     slider_rect = pygame.Rect(10, height + 10, width - 20, 20)
@@ -285,6 +330,9 @@ try:
                     speed_multiplier = min(16.0, speed_multiplier * 2.0)
                 elif event.key == pygame.K_MINUS:
                     speed_multiplier = max(0.125, speed_multiplier / 2.0)
+                elif event.key == pygame.K_r:
+                    show_render_texture = not show_render_texture
+                    print(f"Render texture mode: {'ON' if show_render_texture else 'OFF'}")
             
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.pos[1] > height:
@@ -313,6 +361,21 @@ try:
             if ret:
                 current_frame += 1
             else:
+                # End of video - reset everything
+                print("Video ended - resetting trackers and render texture")
+                
+                # Clear all trackers
+                user_trackers.clear()
+                auto_trackers.clear()
+                
+                # Reset render texture to black
+                glBindFramebuffer(GL_FRAMEBUFFER, framebuffer)
+                glViewport(0, 0, render_texture_size, render_texture_size)
+                glClearColor(0.0, 0.0, 0.0, 1.0)
+                glClear(GL_COLOR_BUFFER_BIT)
+                glBindFramebuffer(GL_FRAMEBUFFER, 0)
+                glViewport(0, 0, width, height + 50)
+                
                 # Loop video
                 current_frame = 0
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -347,26 +410,166 @@ try:
                         auto_trackers.append(new_tracker)
                         print(f"Auto-created tracker at ({x}, {y}) with quality {quality:.1f}")
             
-            # Dim the frame by 50% to make trackers more visible
+            # Upload frame to OpenGL texture
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame_rgb = (frame_rgb * 0.5).astype(np.uint8)
-            frame_surface = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
-            screen.blit(frame_surface, (0, 0))
+            frame_rgb = (frame_rgb * 0.5).astype(np.uint8)  # Dim by 50%
+            
+            # Flip vertically for OpenGL coordinate system
+            frame_rgb = np.flipud(frame_rgb)
+            
+            glBindTexture(GL_TEXTURE_2D, video_texture)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, frame_rgb)
+            
+            # Calculate rotation angle (one revolution per second)
+            current_time = pygame.time.get_ticks()
+            rotation_angle = ((current_time - start_time) / 1000.0) * 360.0  # degrees per second
+            
+            # Render to 4096x4096 texture
+            glBindFramebuffer(GL_FRAMEBUFFER, framebuffer)
+            glViewport(0, 0, render_texture_size, render_texture_size)
+            
+            # Set up orthographic projection for render texture
+            glMatrixMode(GL_PROJECTION)
+            glPushMatrix()
+            glLoadIdentity()
+            glOrtho(0, render_texture_size, render_texture_size, 0, -1, 1)
+            glMatrixMode(GL_MODELVIEW)
+            glPushMatrix()
+            glLoadIdentity()
+            
+            # Don't clear render texture - pixels outside stamp remain persistent
+            
+            # Draw rotated video at center
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, video_texture)
+            glColor3f(1.0, 1.0, 1.0)
+            
+            # Move to center and rotate
+            glTranslatef(render_texture_size/2, render_texture_size/2, 0)
+            glRotatef(rotation_angle, 0, 0, 1)
+            
+            # Scale video to fit nicely in render texture (adjust as needed)
+            scale = min(render_texture_size / width, render_texture_size / height) * 0.3
+            glScalef(scale, scale, 1)
+            
+            glBegin(GL_QUADS)
+            glTexCoord2f(0, 1); glVertex2f(-width/2, -height/2)
+            glTexCoord2f(1, 1); glVertex2f(width/2, -height/2)
+            glTexCoord2f(1, 0); glVertex2f(width/2, height/2)
+            glTexCoord2f(0, 0); glVertex2f(-width/2, height/2)
+            glEnd()
+            
+            glDisable(GL_TEXTURE_2D)
+            
+            # Restore matrices
+            glPopMatrix()
+            glMatrixMode(GL_PROJECTION)
+            glPopMatrix()
+            glMatrixMode(GL_MODELVIEW)
+            
+            # Return to default framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, 0)
+            glViewport(0, 0, width, height + 50)
+            
+            # Set up original projection
+            glMatrixMode(GL_PROJECTION)
+            glLoadIdentity()
+            glOrtho(0, width, height + 50, 0, -1, 1)
+            glMatrixMode(GL_MODELVIEW)
+            glLoadIdentity()
+            
+            # Clear main screen
+            glClear(GL_COLOR_BUFFER_BIT)
+            
+            if show_render_texture:
+                # Show the 4096x4096 render texture
+                glEnable(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, render_texture)
+                glColor3f(1.0, 1.0, 1.0)
+                
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 1); glVertex2f(0, 0)
+                glTexCoord2f(1, 1); glVertex2f(width, 0)
+                glTexCoord2f(1, 0); glVertex2f(width, height)
+                glTexCoord2f(0, 0); glVertex2f(0, height)
+                glEnd()
+                
+                glDisable(GL_TEXTURE_2D)
+            else:
+                # Show normal video
+                glEnable(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, video_texture)
+                glColor3f(1.0, 1.0, 1.0)
+                
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 1); glVertex2f(0, 0)
+                glTexCoord2f(1, 1); glVertex2f(width, 0)
+                glTexCoord2f(1, 0); glVertex2f(width, height)
+                glTexCoord2f(0, 0); glVertex2f(0, height)
+                glEnd()
+                
+                glDisable(GL_TEXTURE_2D)
         
-        screen.fill((50, 50, 50), (0, height, width, 50))
-        draw_slider(screen, current_frame, total_frames, width)
+        # Draw UI background
+        glColor3f(0.2, 0.2, 0.2)
+        glBegin(GL_QUADS)
+        glVertex2f(0, height)
+        glVertex2f(width, height)
+        glVertex2f(width, height + 50)
+        glVertex2f(0, height + 50)
+        glEnd()
         
-        font = pygame.font.Font(None, 24)
-        frame_text = font.render(f"Frame: {current_frame}/{total_frames}", True, (255, 255, 255))
-        speed_text = font.render(f"Speed: {speed_multiplier}x", True, (255, 255, 255))
-        tracker_text = font.render(f"User: {len(user_trackers)} Auto: {len(auto_trackers)}", True, (255, 255, 255))
-        screen.blit(frame_text, (width - 200, height + 15))
-        screen.blit(speed_text, (10, height + 25))
-        screen.blit(tracker_text, (width // 2 - 80, height + 15))
+        # Draw slider background
+        glColor3f(0.4, 0.4, 0.4)
+        glBegin(GL_QUADS)
+        glVertex2f(10, height + 10)
+        glVertex2f(width - 10, height + 10)
+        glVertex2f(width - 10, height + 30)
+        glVertex2f(10, height + 30)
+        glEnd()
         
-        # Draw all trackers
-        for tracker in user_trackers + auto_trackers:
-            tracker.draw(screen, font)
+        # Draw slider handle
+        if total_frames > 0:
+            slider_pos = 10 + int((current_frame / (total_frames - 1)) * (width - 20))
+            glColor3f(1.0, 1.0, 1.0)
+            glBegin(GL_QUADS)
+            glVertex2f(slider_pos, height + 10)
+            glVertex2f(slider_pos + 10, height + 10)
+            glVertex2f(slider_pos + 10, height + 30)
+            glVertex2f(slider_pos, height + 30)
+            glEnd()
+        
+        # Only draw trackers in normal video mode
+        if not show_render_texture:
+            for tracker in user_trackers + auto_trackers:
+                tracker.draw_opengl()
+            
+            # Draw 600x600 render texture preview in top right corner
+            preview_size = 600
+            preview_x = width - preview_size - 10
+            preview_y = 10
+            
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, render_texture)
+            glColor3f(1.0, 1.0, 1.0)
+            
+            glBegin(GL_QUADS)
+            glTexCoord2f(0, 1); glVertex2f(preview_x, preview_y)
+            glTexCoord2f(1, 1); glVertex2f(preview_x + preview_size, preview_y)
+            glTexCoord2f(1, 0); glVertex2f(preview_x + preview_size, preview_y + preview_size)
+            glTexCoord2f(0, 0); glVertex2f(preview_x, preview_y + preview_size)
+            glEnd()
+            
+            # Draw border around preview
+            glDisable(GL_TEXTURE_2D)
+            glColor3f(0.5, 0.5, 0.5)
+            glLineWidth(2)
+            glBegin(GL_LINE_LOOP)
+            glVertex2f(preview_x, preview_y)
+            glVertex2f(preview_x + preview_size, preview_y)
+            glVertex2f(preview_x + preview_size, preview_y + preview_size)
+            glVertex2f(preview_x, preview_y + preview_size)
+            glEnd()
     
         pygame.display.flip()
         clock.tick(fps * speed_multiplier if playing else 60)
