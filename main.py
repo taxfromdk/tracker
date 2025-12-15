@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 
 class Tracker:
-    def __init__(self, x, y, frame, patch_size=32, search_size=100):
+    def __init__(self, x, y, frame, patch_size=32, search_size=100, auto_created=False):
         self.initial_pos = (x, y)
         self.current_pos = (x, y)
         self.patch_size = patch_size
@@ -15,6 +15,8 @@ class Tracker:
         self.reference_patch = self._extract_patch(frame, x, y)
         self.alive = True
         self.lock = threading.Lock()
+        self.auto_created = auto_created
+        self.frames_lived = 0
     
     def _extract_patch(self, image, x, y):
         h, w = image.shape[:2]
@@ -61,6 +63,7 @@ class Tracker:
                 self.correlation_score = max_val
                 if max_val >= 0.6:
                     self.current_pos = (x_start + max_loc[0], y_start + max_loc[1])
+                    self.frames_lived += 1
                 else:
                     self.alive = False
     
@@ -71,6 +74,7 @@ class Tracker:
             
             current_pos = self.current_pos
             correlation_score = self.correlation_score
+            frames_lived = self.frames_lived
         
         # Draw blue rectangle for search area
         search_rect = pygame.Rect(
@@ -83,14 +87,15 @@ class Tracker:
         search_rect.clamp_ip(pygame.Rect(0, 0, screen.get_width(), screen.get_height() - 50))
         pygame.draw.rect(screen, (0, 100, 255), search_rect, 1)
         
-        # Draw green rectangle at initial position
+        # Draw rectangle at current position (green for manual, cyan for auto)
         patch_rect = pygame.Rect(
-            self.initial_pos[0] - self.patch_size,
-            self.initial_pos[1] - self.patch_size,
+            current_pos[0] - self.patch_size,
+            current_pos[1] - self.patch_size,
             2 * self.patch_size + 1,
             2 * self.patch_size + 1
         )
-        pygame.draw.rect(screen, (0, 255, 0), patch_rect, 2)
+        color = (0, 255, 255) if self.auto_created else (0, 255, 0)
+        pygame.draw.rect(screen, color, patch_rect, 2)
         
         # Draw red dot at current position
         pygame.draw.circle(screen, (255, 0, 0), current_pos, 5, 2)
@@ -100,6 +105,11 @@ class Tracker:
         text_x = min(current_pos[0] + 10, screen.get_width() - 50)
         text_y = max(0, current_pos[1] - 10)
         screen.blit(corr_text, (text_x, text_y))
+        
+        # Display frames lived below correlation score
+        frames_text = font.render(f"{frames_lived}", True, (255, 255, 255))
+        frames_y = min(current_pos[1] + 10, screen.get_height() - 50)
+        screen.blit(frames_text, (text_x, frames_y))
 
 pygame.init()
 
@@ -121,7 +131,8 @@ clock = pygame.time.Clock()
 playing = True
 dragging = False
 speed_multiplier = 1.0
-trackers = []
+user_trackers = []
+auto_trackers = []
 executor = ThreadPoolExecutor(max_workers=8)
 
 def draw_slider(screen, current_frame, total_frames, width):
@@ -138,6 +149,114 @@ def draw_slider(screen, current_frame, total_frames, width):
 def get_frame_from_slider_pos(mouse_x, width, total_frames):
     relative_x = max(0, min(mouse_x - 10, width - 20))
     return int((relative_x / (width - 20)) * (total_frames - 1))
+
+def find_good_features(frame, user_trackers, auto_trackers, max_trackers=10, min_distance=500):
+    """Find good corner features to track, avoiding existing tracker positions"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+    
+    # Get all existing tracker positions (both user and auto)
+    existing_positions = []
+    for tracker in user_trackers + auto_trackers:
+        with tracker.lock:
+            if tracker.alive:
+                existing_positions.append(tracker.current_pos)
+    
+    # Find corners using goodFeaturesToTrack
+    corners = cv2.goodFeaturesToTrack(
+        gray,
+        maxCorners=100,  # Find more candidates than we need
+        qualityLevel=0.01,
+        minDistance=50,  # Minimum distance between detected corners
+        blockSize=3
+    )
+    
+    if corners is None:
+        return []
+    
+    # Convert to list of (x, y, quality) tuples
+    candidates = []
+    for corner in corners:
+        x, y = corner.ravel()
+        x, y = int(x), int(y)
+        
+        # Calculate quality score using corner response
+        if 32 <= x < gray.shape[1] - 32 and 32 <= y < gray.shape[0] - 32:
+            # Base quality measure using local variance
+            patch = gray[y-16:y+16, x-16:x+16]
+            corner_quality = np.var(patch)
+            
+            # Distance bonus: farther from existing trackers = higher quality
+            min_distance_to_existing = float('inf')
+            for ex_x, ex_y in existing_positions:
+                distance = np.sqrt((x - ex_x)**2 + (y - ex_y)**2)
+                min_distance_to_existing = min(min_distance_to_existing, distance)
+            
+            # Calculate feature stability - penalize straight edges that can "slide"
+            # Check gradient directions in a small window around the point
+            if y > 5 and y < gray.shape[0] - 5 and x > 5 and x < gray.shape[1] - 5:
+                # Calculate gradients in x and y directions
+                gx = cv2.Sobel(gray[y-5:y+5, x-5:x+5], cv2.CV_64F, 1, 0, ksize=3)
+                gy = cv2.Sobel(gray[y-5:y+5, x-5:x+5], cv2.CV_64F, 0, 1, ksize=3)
+                
+                # Calculate gradient magnitudes
+                grad_mag = np.sqrt(gx**2 + gy**2)
+                
+                # Check for corner-like features vs edge-like features
+                # Good corners have strong gradients in multiple directions
+                gx_var = np.var(gx)
+                gy_var = np.var(gy)
+                
+                # Corner score: high when both x and y gradients have variance (intersecting edges)
+                # Low when only one direction has strong gradients (straight edge)
+                corner_stability = min(gx_var, gy_var) / (max(gx_var, gy_var) + 1e-6)
+                stability_bonus = corner_stability * 500  # Bonus for corner-like features
+            else:
+                stability_bonus = 0
+            
+            # Distance from image edges (prefer points away from edges for tracking space)
+            edge_distance = min(x, y, gray.shape[1] - x, gray.shape[0] - y)
+            
+            # If no existing trackers, use base quality with edge and stability consideration
+            if min_distance_to_existing == float('inf'):
+                final_quality = corner_quality + edge_distance * 2 + stability_bonus
+            else:
+                # Combine corner quality with distance bonus, edge distance, and stability
+                distance_bonus = min_distance_to_existing / 10.0  # Scale distance
+                edge_bonus = edge_distance / 10.0  # Reduced edge bonus weight
+                final_quality = corner_quality + distance_bonus * 1000 + edge_bonus * 50 + stability_bonus
+            
+            candidates.append((x, y, final_quality))
+    
+    # Sort by quality (highest first) - now favors distance
+    candidates.sort(key=lambda c: c[2], reverse=True)
+    
+    # Filter candidates by distance to existing trackers
+    good_candidates = []
+    for x, y, quality in candidates:
+        # Check distance to existing trackers
+        too_close = False
+        for ex_x, ex_y in existing_positions:
+            distance = np.sqrt((x - ex_x)**2 + (y - ex_y)**2)
+            if distance < min_distance:
+                too_close = True
+                break
+        
+        if not too_close:
+            # Check distance to already selected candidates
+            for gx, gy, _ in good_candidates:
+                distance = np.sqrt((x - gx)**2 + (y - gy)**2)
+                if distance < min_distance:
+                    too_close = True
+                    break
+        
+        if not too_close:
+            good_candidates.append((x, y, quality))
+        
+        # Stop when we have enough candidates
+        if len(good_candidates) >= max_trackers:
+            break
+    
+    return good_candidates
 
 try:
     while True:
@@ -173,14 +292,14 @@ try:
                     current_frame = get_frame_from_slider_pos(event.pos[0], width, total_frames)
                     cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
                 else:
-                    # Create a new tracker at click position
+                    # Create a new user tracker at click position
                     cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
                     ret, frame = cap.read()
                     if ret:
-                        new_tracker = Tracker(event.pos[0], event.pos[1], frame)
-                        trackers.append(new_tracker)
-                        print(f"New tracker at: ({event.pos[0]}, {event.pos[1]})")
-                        print(f"Total trackers: {len(trackers)}")
+                        new_tracker = Tracker(event.pos[0], event.pos[1], frame, auto_created=False)
+                        user_trackers.append(new_tracker)
+                        print(f"User tracker at: ({event.pos[0]}, {event.pos[1]})")
+                        print(f"Total trackers: {len(user_trackers + auto_trackers)}")
             
             elif event.type == pygame.MOUSEBUTTONUP:
                 dragging = False
@@ -203,17 +322,34 @@ try:
             ret, frame = cap.read()
         
         if ret:
-            # Update all trackers in parallel
-            if trackers:
-                futures = [executor.submit(tracker.update, frame) for tracker in trackers]
-                # Wait for all updates to complete
-                for future in futures:
-                    future.result()
+            # Only update trackers when video is playing
+            if playing:
+                # Update all trackers in parallel
+                all_trackers = user_trackers + auto_trackers
+                if all_trackers:
+                    futures = [executor.submit(tracker.update, frame) for tracker in all_trackers]
+                    # Wait for all updates to complete
+                    for future in futures:
+                        future.result()
                 
                 # Remove dead trackers
-                trackers[:] = [t for t in trackers if t.alive]
+                user_trackers[:] = [t for t in user_trackers if t.alive]
+                auto_trackers[:] = [t for t in auto_trackers if t.alive]
+                
+                # Only search for features when we actually need more auto trackers
+                trackers_needed = 10 - len(auto_trackers)
+                if trackers_needed > 0:
+                    candidates = find_good_features(frame, user_trackers, auto_trackers, max_trackers=trackers_needed, min_distance=300)
+                    for x, y, quality in candidates:
+                        if len(auto_trackers) >= 10:
+                            break
+                        new_tracker = Tracker(x, y, frame, auto_created=True)
+                        auto_trackers.append(new_tracker)
+                        print(f"Auto-created tracker at ({x}, {y}) with quality {quality:.1f}")
             
+            # Dim the frame by 50% to make trackers more visible
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = (frame_rgb * 0.5).astype(np.uint8)
             frame_surface = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
             screen.blit(frame_surface, (0, 0))
         
@@ -223,13 +359,13 @@ try:
         font = pygame.font.Font(None, 24)
         frame_text = font.render(f"Frame: {current_frame}/{total_frames}", True, (255, 255, 255))
         speed_text = font.render(f"Speed: {speed_multiplier}x", True, (255, 255, 255))
-        tracker_text = font.render(f"Trackers: {len(trackers)}", True, (255, 255, 255))
+        tracker_text = font.render(f"User: {len(user_trackers)} Auto: {len(auto_trackers)}", True, (255, 255, 255))
         screen.blit(frame_text, (width - 200, height + 15))
         screen.blit(speed_text, (10, height + 25))
-        screen.blit(tracker_text, (width // 2 - 50, height + 15))
+        screen.blit(tracker_text, (width // 2 - 80, height + 15))
         
         # Draw all trackers
-        for tracker in trackers:
+        for tracker in user_trackers + auto_trackers:
             tracker.draw(screen, font)
     
         pygame.display.flip()
